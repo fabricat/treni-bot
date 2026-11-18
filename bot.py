@@ -156,24 +156,31 @@ class App:
     def subscriptions(self,user_id):
         return self.db().execute("SELECT * FROM subscriptions WHERE user_id=? ORDER BY id",(user_id,)).fetchall()
 
-    def train_link(self,number,run_key):
+    def train_link(self,number,run_key,label='Vedi su ViaggiaTreno'):
         origin,_,millis=run_key.split(':')
         url=f"http://www.viaggiatreno.it/infomobilitamobile/pages/cercaTreno/cercaTreno.jsp?treno={quote(str(number))}&origine={quote(origin)}&datapartenza={quote(millis)}"
-        return f'<a href="{html.escape(url,quote=True)}">Vedi su ViaggiaTreno</a>'
+        return f'<a href="{html.escape(url,quote=True)}">{html.escape(str(label))}</a>'
 
-    def known_link(self,sub,conn=None):
+    def known_link(self,sub,conn=None,label='Vedi su ViaggiaTreno'):
         # run_key dell'ultima corsa valutata oggi, salvato in notification_state.date come 'data|origine:numero:millis'
         row=(conn or self.db()).execute('SELECT date FROM notification_state WHERE subscription_id=?',(sub['id'],)).fetchone()
         if row and row['date'].startswith(datetime.now(self.tz).date().isoformat()) and '|' in row['date']:
-            return '\n'+self.train_link(sub['number'],row['date'].split('|',1)[1])
+            return '\n'+self.train_link(sub['number'],row['date'].split('|',1)[1],label)
         return ''
 
     def list_preferences(self,user):
         days=['lun','mar','mer','gio','ven','sab','dom']
-        lines=[f"Fuso: {user['timezone']} | Pausa: {'si' if user['paused'] else 'no'}"]
-        for s in self.subscriptions(user['id']):
-            lines.append(f"Treno {s['number']} da {html.escape(s['station'])} | {','.join(days[d] for d in json.loads(s['weekdays']))} | {s['start']}-{s['end']} | soglia {s['threshold']} min{self.known_link(s)}")
-        return '\n'.join(lines) if len(lines)>1 else lines[0]+'\nNessun preferito: /aggiungi'
+        subs=self.subscriptions(user['id'])
+        head=f"Pausa: {'si' if user['paused'] else 'no'}"
+        if not subs:
+            return head+'\nNessun preferito: /aggiungi'
+        lines=[head]
+        for s in subs:
+            wd=json.loads(s['weekdays'])
+            link=self.known_link(s,label=s['number'])
+            number=link[1:] if link else s['number']
+            lines.append(f"• Treno {number} da {html.escape(s['station'])} | {'tutti' if len(wd)==7 else ','.join(days[d] for d in wd)} | {s['start']}-{s['end']} | soglia {s['threshold']} min")
+        return '\n'.join(lines)
 
     def handle(self, update):
         msg=update.get('message',{})
@@ -187,7 +194,7 @@ class App:
             return
         cmd=parts[0].split('@')[0].lower() if text.startswith('/') else ''
         user=self.user(sender)
-        known={'/start','/id','/aiuto','/preferiti','/aggiungi','/modifica','/elimina','/stato','/pausa','/riprendi','/annulla','/conferma','/approva','/rifiuta','/utenti','/cancella_account','/fuso'}
+        known={'/start','/id','/aiuto','/preferiti','/aggiungi','/modifica','/elimina','/stato','/pausa','/riprendi','/annulla','/conferma','/approva','/rifiuta','/utenti','/cancella_account'}
         event(logging.INFO if user and user['status']=='active' else logging.DEBUG,'command.received',user=user['id'] if user else None,command=cmd if cmd in known else 'input')
         if cmd=='/id':
             self.queue(chat['id'],f"Il tuo Telegram user ID: {sender}"+(f"\nID interno: {user['id']}" if user else ''))
@@ -247,7 +254,7 @@ class App:
             event(logging.INFO,'user.access_changed',user=target['id'],status=status)
             return
         if cmd in ('/start','/aiuto'):
-            self.reply(user,'Bot treni personale\n/preferiti\n/aggiungi\n/modifica NUMERO_TRENO\n/elimina NUMERO_TRENO\n/stato\n/pausa\n/riprendi\n/fuso Europe/Rome\n/annulla\n/cancella_account\nI giorni e gli orari sono personali.\n'+('/utenti - /approva ID - /rifiuta ID' if admin else ''))
+            self.reply(user,'Bot treni personale\n/preferiti\n/aggiungi\n/modifica NUMERO_TRENO\n/elimina NUMERO_TRENO\n/stato\n/pausa\n/riprendi\n/annulla\n/cancella_account\nI giorni e gli orari sono personali.\n'+('/utenti - /approva ID - /rifiuta ID' if admin else ''))
         elif cmd=='/annulla':
             with self.db() as db: db.execute('DELETE FROM conversations WHERE user_id=?',(user['id'],))
             self.reply(user,'Operazione annullata.')
@@ -259,15 +266,6 @@ class App:
                     db.execute("UPDATE outbox SET status='cancelled' WHERE user_id=? AND subscription_id IS NOT NULL AND status='pending'",(user['id'],))
             self.reply(user,'Avvisi sospesi.' if cmd=='/pausa' else 'Avvisi riattivati nelle finestre configurate.')
             event(logging.INFO,'user.pause_changed',user=user['id'],paused=cmd=='/pausa')
-        elif cmd=='/fuso':
-            try:
-                if len(parts)!=2: raise ValueError()
-                ZoneInfo(parts[1])
-            except (ValueError,KeyError):
-                self.reply(user,'Uso: /fuso Europe/Rome (nome IANA valido)')
-                return
-            with self.db() as db: db.execute('UPDATE users SET timezone=? WHERE id=?',(parts[1],user['id']))
-            self.reply(user,'Fuso aggiornato. Le finestre sono interpretate nel nuovo fuso.')
         elif cmd in ('/aggiungi','/modifica'):
             data={}
             if cmd=='/modifica':
@@ -331,7 +329,7 @@ class App:
                 else:
                     if not values or any(v not in names for v in values):raise ValueError('Usa lun,mar,mer,gio,ven,sab,dom.')
                     data['days']=sorted({names[v] for v in values})
-                step='window';prompt=f"Finestra locale ({user['timezone']})? Esempio 06:50-09:00. Non puo attraversare mezzanotte."
+                step='window';prompt=f"Finestra locale? (es. 06:50-09:00) Non puo attraversare mezzanotte."
             elif step=='window':
                 if not re.fullmatch(r'\d{2}:\d{2}-\d{2}:\d{2}',text):raise ValueError('Formato richiesto HH:MM-HH:MM.')
                 start,end=text.split('-')
@@ -345,7 +343,7 @@ class App:
                 if not text.isdigit() or not 1<=int(text)<=60:raise ValueError('Valore valido: 1-60.')
                 data['change']=int(text);step='confirm'
                 prompt=(f"Treno {data['number']} da {html.escape(data['station'])}\nGiorni: {','.join(['lun','mar','mer','gio','ven','sab','dom'][d] for d in data['days'])}\n"
-                        f"Fascia {data['start']}-{data['end']} ({user['timezone']})\nSoglia {data['threshold']} min, variazione {data['change']} min.\n"
+                        f"Fascia {data['start']}-{data['end']} ({self.tz})\nSoglia {data['threshold']} min, variazione {data['change']} min.\n"
                         'Verifica della corsa rinviata alla prima interrogazione: non validata online in questa procedura.\n/conferma o /annulla')
             elif step in ('confirm','delete','delete_account'):
                 if cmd!='/conferma':raise ValueError('Usa /conferma oppure /annulla.')
@@ -404,17 +402,17 @@ class App:
         if len(found)!=1:raise SourceError('Corsa/fermata assente o ambigua')
         return found[0]
 
-    def describe(self,sub,data,stop,tz):
+    def describe(self,sub,data,stop):
         delay=data.get('ritardo')
         if isinstance(delay,bool) or not isinstance(delay,(int,float)):raise SourceError('Ritardo non numerico')
-        fmt=lambda ms:datetime.fromtimestamp(float(ms)/1000,tz).strftime('%H:%M') if ms else 'n/d'
+        fmt=lambda ms:datetime.fromtimestamp(float(ms)/1000,self.tz).strftime('%H:%M') if ms else 'n/d'
         text=f"Treno {sub['number']} - {html.escape(sub['station'])}\nPartenza prevista: {fmt(stop.get('partenza_teorica'))}\nRitardo corrente del treno: {delay:+g} min"
         if stop.get('partenzaReale'):text+='\nPartito dalla fermata: '+fmt(stop['partenzaReale'])
         if data.get('oraUltimoRilevamento'):text+='\nUltimo rilevamento: '+fmt(data['oraUltimoRilevamento'])
         return delay,text+'\nIl ritardo corrente non e una previsione garantita alla tua fermata.\n'+self.train_link(sub['number'],data['_run_key'])
 
     def evaluate(self,sub,user,data,stop,now):
-        delay,text=self.describe(sub,data,stop,ZoneInfo(user['timezone']))
+        delay,text=self.describe(sub,data,stop)
         date=now.date().isoformat()+'|'+data['_run_key']
         with self.db() as db:
             current=db.execute('SELECT * FROM subscriptions WHERE id=? AND user_id=?',(sub['id'],user['id'])).fetchone()
@@ -460,7 +458,7 @@ class App:
         manual={int(r['key'].split(':')[1]):r['value'] for r in db.execute("SELECT key,value FROM meta WHERE key LIKE 'manual:%'")}
         groups={}
         for user in users:
-            local=datetime.now(ZoneInfo(user['timezone']))
+            local=datetime.now(self.tz)
             is_manual=user['id'] in manual
             subs=self.subscriptions(user['id'])
             scheduled_count=0
@@ -489,7 +487,7 @@ class App:
                     data,stop=self.choose(candidates,sub['station'])
                     self.failures.recovered(f"subscription:{sub['id']}")
                     if active:self.evaluate(sub,user,data,stop,now)
-                    if is_manual:self.reply(user,self.describe(sub,data,stop,ZoneInfo(user['timezone']))[1]+'\nDati acquisiti di recente (cache massima '+str(self.config.get('cache_seconds',45))+' s).')
+                    if is_manual:self.reply(user,self.describe(sub,data,stop)[1]+'\nDati acquisiti di recente (cache massima '+str(self.config.get('cache_seconds',45))+' s).')
                     checked+=1
                 except SourceError as exc:
                     self.failures.failed(f"subscription:{sub['id']}",exc)
@@ -580,7 +578,6 @@ class App:
             BotCommand('stato','Stato dei preferiti nella finestra attuale'),
             BotCommand('pausa','Sospendi gli avvisi'),
             BotCommand('riprendi','Riattiva gli avvisi'),
-            BotCommand('fuso','Imposta il fuso orario: /fuso Europe/Rome'),
             BotCommand('annulla','Annulla l\'operazione in corso'),
             BotCommand('id','Mostra il tuo Telegram ID'),
             BotCommand('cancella_account','Elimina account e dati'),

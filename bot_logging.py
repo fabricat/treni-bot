@@ -14,7 +14,14 @@ def clean(value):
     if token:
         text = text.replace(token, "[TOKEN]")
     text = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{20,}", "[TOKEN]", text)
-    text = re.sub(r"https?://[^\s<>\"']+", "[URL]", text)
+
+    def redact_url(match):
+        # conserva host e ultimo segmento del path (es. metodo API), scarta query e token
+        host, path = match.group(1), (match.group(2) or "").split("?")[0].rstrip("/")
+        last = path.rsplit("/", 1)[-1]
+        return f"[URL {host}/{last}]" if last else f"[URL {host}]"
+
+    text = re.sub(r"https?://([^\s/<>\"']+)([^\s<>\"']*)", redact_url, text)
     return text.replace("\r", r"\r").replace("\n", r"\n").replace("\t", r"\t")
 
 
@@ -52,6 +59,9 @@ def setup(timezone="Europe/Rome"):
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level)
+    # il polling getUpdates logga una riga INFO per ogni richiesta: solo rumore
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(max(level, logging.WARNING))
 
 
 def event(level, name, **fields):
