@@ -1,0 +1,36 @@
+services:
+  treni-bot:
+    image: ghcr.io/fabricat/treni-bot:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/state.sqlite
+      LOG_LEVEL: DEBUG
+      REGISTRATION_MODE: approval
+    volumes:
+      - treni-data:/data
+    read_only: true
+    # tmpfs:
+    #   - /tmp
+    # cap_drop:
+    #   - ALL
+    # security_opt:
+    #   - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: '2'
+
+  sqlite-webui:
+    platform: linux/amd64
+    image: coleifer/sqlite-web
+    ports:
+      - "8087:8080"
+    volumes:
+      - treni-data:/data:ro
+    environment:
+      SQLITE_DATABASE: state.sqlite
+
+volumes:
+  treni-data: {}

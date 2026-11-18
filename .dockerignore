@@ -1,0 +1,9 @@
+.DS_Store
+.env
+.env.example
+.git
+__pycache__
+*.sqlite*
+data/
+compose.yaml
+README.md
