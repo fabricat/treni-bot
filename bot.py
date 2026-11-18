@@ -68,6 +68,7 @@ class App:
             id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER UNIQUE NOT NULL,
             chat_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
             paused INTEGER NOT NULL DEFAULT 0, timezone TEXT NOT NULL,
+            change_min INTEGER NOT NULL DEFAULT 5,
             created REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS subscriptions(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -104,8 +105,14 @@ class App:
                     old_offset=db.execute("SELECT value FROM state WHERE key='offset'").fetchone()
                     if old_offset:
                         db.execute("INSERT OR REPLACE INTO meta VALUES ('telegram_offset',?)",(str(json.loads(old_offset[0])),))
-                db.execute("INSERT INTO meta VALUES ('schema_version','2')")
-                event(logging.INFO,"database.migrated",schema=2)
+                db.execute("INSERT INTO meta VALUES ('schema_version','3')")
+                event(logging.INFO,"database.migrated",schema=3)
+            elif db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]=='2':
+                # v3: la variazione minima diventa un parametro utente; eredita quella del primo preferito
+                db.execute("ALTER TABLE users ADD COLUMN change_min INTEGER NOT NULL DEFAULT 5")
+                db.execute("UPDATE users SET change_min=COALESCE((SELECT s.change_min FROM subscriptions s WHERE s.user_id=users.id ORDER BY s.id LIMIT 1),5)")
+                db.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
+                event(logging.INFO,"database.migrated",schema=3)
 
     def request(self, url, timeout=20):
         operation = urlsplit(url).path.removeprefix("/infomobilita/resteasy/viaggiatreno/").split('/')[0]
@@ -171,7 +178,7 @@ class App:
     def list_preferences(self,user):
         days=['lun','mar','mer','gio','ven','sab','dom']
         subs=self.subscriptions(user['id'])
-        head=f"Pausa: {'si' if user['paused'] else 'no'}"
+        head=f"Pausa: {'si' if user['paused'] else 'no'} | Variazione nuovo avviso: {user['change_min']} min"
         if not subs:
             return head+'\nNessun preferito: /aggiungi'
         lines=[head]
@@ -194,7 +201,7 @@ class App:
             return
         cmd=parts[0].split('@')[0].lower() if text.startswith('/') else ''
         user=self.user(sender)
-        known={'/start','/id','/aiuto','/preferiti','/aggiungi','/modifica','/elimina','/stato','/pausa','/riprendi','/annulla','/conferma','/approva','/rifiuta','/utenti','/cancella_account'}
+        known={'/start','/id','/aiuto','/preferiti','/aggiungi','/modifica','/elimina','/stato','/pausa','/riprendi','/variazione','/annulla','/conferma','/approva','/rifiuta','/utenti','/cancella_account'}
         event(logging.INFO if user and user['status']=='active' else logging.DEBUG,'command.received',user=user['id'] if user else None,command=cmd if cmd in known else 'input')
         if cmd=='/id':
             self.queue(chat['id'],f"Il tuo Telegram user ID: {sender}"+(f"\nID interno: {user['id']}" if user else ''))
@@ -254,7 +261,7 @@ class App:
             event(logging.INFO,'user.access_changed',user=target['id'],status=status)
             return
         if cmd in ('/start','/aiuto'):
-            self.reply(user,'Bot treni personale\n/preferiti\n/aggiungi\n/modifica [NUMERO_TRENO]\n/elimina [NUMERO_TRENO]\n/stato\n/pausa\n/riprendi\n/annulla\n/cancella_account\nI giorni e gli orari sono personali.\n'+('\nComandi amministratore: /utenti - /approva ID - /rifiuta ID' if admin else ''))
+            self.reply(user,'Bot treni personale\n/preferiti\n/aggiungi\n/modifica [NUMERO_TRENO]\n/elimina [NUMERO_TRENO]\n/stato\n/pausa\n/riprendi\n/variazione MINUTI\n/annulla\n/cancella_account\nI giorni e gli orari sono personali.\n'+('\nComandi amministratore: /utenti - /approva ID - /rifiuta ID' if admin else ''))
         elif cmd=='/annulla':
             with self.db() as db: db.execute('DELETE FROM conversations WHERE user_id=?',(user['id'],))
             self.reply(user,'Operazione annullata.')
@@ -266,6 +273,12 @@ class App:
                     db.execute("UPDATE outbox SET status='cancelled' WHERE user_id=? AND subscription_id IS NOT NULL AND status='pending'",(user['id'],))
             self.reply(user,'Avvisi sospesi.' if cmd=='/pausa' else 'Avvisi riattivati nelle finestre configurate.')
             event(logging.INFO,'user.pause_changed',user=user['id'],paused=cmd=='/pausa')
+        elif cmd=='/variazione':
+            if len(parts)!=2 or not parts[1].isdigit() or not 1<=int(parts[1])<=60:
+                self.reply(user,f"Variazione minima perche un nuovo avviso venga inviato.\nAttuale: {user['change_min']} min. Uso: /variazione MINUTI (1-60)")
+                return
+            with self.db() as db: db.execute('UPDATE users SET change_min=? WHERE id=?',(int(parts[1]),user['id']))
+            self.reply(user,f"Variazione minima impostata a {parts[1]} min per tutti i tuoi treni.")
         elif cmd in ('/aggiungi','/modifica'):
             if cmd=='/modifica':
                 if len(parts)<2:
@@ -323,8 +336,9 @@ class App:
     def proceed(self,user,action,sub):
         if action=='modifica':
             # il numero identifica il treno e non e modificabile: si parte dalla stazione
-            self.conversation(user,'station',{'edit_id':sub['id'],'number':sub['number']})
-            self.reply(user,f"Modifica del treno {sub['number']}.\nStazione di salita? Scrivi il nome completo, ad esempio Ottavia. (/annulla per uscire)")
+            cur={'station':sub['station'],'days':json.loads(sub['weekdays']),'start':sub['start'],'end':sub['end'],'threshold':sub['threshold']}
+            self.conversation(user,'station',{'edit_id':sub['id'],'number':sub['number'],'cur':cur})
+            self.reply(user,f"Modifica del treno {sub['number']}. Invia = per mantenere il valore attuale. (/annulla per uscire)\nStazione di salita? Attuale: {html.escape(sub['station'])}")
         else:
             self.conversation(user,'delete',{'id':sub['id']})
             self.reply(user,f"Eliminare il treno {sub['number']} da {html.escape(sub['station'])}? /conferma o /annulla")
@@ -337,6 +351,10 @@ class App:
             with self.db() as db:db.execute('DELETE FROM conversations WHERE user_id=?',(user['id'],))
             self.reply(user,'Procedura scaduta. Riparti con /aggiungi o /modifica NUMERO_TRENO.');return
         data=json.loads(row['data']);step=row['step']
+        days_names=['lun','mar','mer','gio','ven','sab','dom']
+        cur=data.get('cur')
+        keep=cur is not None and text.strip()=='='
+        attuale=lambda value:f" Attuale: {value}" if cur else ''
         try:
             if step=='pick':
                 tokens=text.split()
@@ -348,30 +366,35 @@ class App:
                 if not re.fullmatch(r'\d{1,7}',text):raise ValueError('Inserisci un numero treno valido.')
                 data['number']=text;step='station';prompt='Stazione di salita? Scrivi il nome completo, ad esempio Ottavia.'
             elif step=='station':
-                if cmd or not 2<=len(text)<=100:raise ValueError('Nome stazione non valido.')
-                data['station']=text;step='days';prompt='Giorni? Scrivi lun,mar,mer,gio,ven oppure tutti.'
+                if keep:data['station']=cur['station']
+                elif cmd or not 2<=len(text)<=100:raise ValueError('Nome stazione non valido.')
+                else:data['station']=text
+                step='days';prompt='Giorni? Scrivi lun,mar,mer,gio,ven oppure tutti.'+attuale(cur and ('tutti' if len(cur['days'])==7 else ','.join(days_names[d] for d in cur['days'])))
             elif step=='days':
                 names={'lun':0,'mar':1,'mer':2,'gio':3,'ven':4,'sab':5,'dom':6}
                 values=re.split(r'[,\s]+',text.lower())
-                if text.lower()=='tutti':data['days']=list(range(7))
+                if keep:data['days']=cur['days']
+                elif text.lower()=='tutti':data['days']=list(range(7))
                 else:
                     if not values or any(v not in names for v in values):raise ValueError('Usa lun,mar,mer,gio,ven,sab,dom.')
                     data['days']=sorted({names[v] for v in values})
-                step='window';prompt=f"Finestra locale? (es. 06:50-09:00) Non puo attraversare mezzanotte."
+                step='window';prompt='Finestra locale? (es. 06:50-09:00) Non puo attraversare mezzanotte.'+attuale(cur and f"{cur['start']}-{cur['end']}")
             elif step=='window':
-                if not re.fullmatch(r'\d{2}:\d{2}-\d{2}:\d{2}',text):raise ValueError('Formato richiesto HH:MM-HH:MM.')
-                start,end=text.split('-')
-                datetime.strptime(start,'%H:%M');datetime.strptime(end,'%H:%M')
-                if start>=end:raise ValueError('Inizio deve precedere fine nello stesso giorno.')
-                data.update(start=start,end=end);step='threshold';prompt='Soglia ritardo in minuti? Da 1 a 180.'
+                if keep:data.update(start=cur['start'],end=cur['end'])
+                else:
+                    if not re.fullmatch(r'\d{2}:\d{2}-\d{2}:\d{2}',text):raise ValueError('Formato richiesto HH:MM-HH:MM.')
+                    start,end=text.split('-')
+                    datetime.strptime(start,'%H:%M');datetime.strptime(end,'%H:%M')
+                    if start>=end:raise ValueError('Inizio deve precedere fine nello stesso giorno.')
+                    data.update(start=start,end=end)
+                step='threshold';prompt='Soglia ritardo in minuti? Da 1 a 180.'+attuale(cur and cur['threshold'])
             elif step=='threshold':
-                if not text.isdigit() or not 1<=int(text)<=180:raise ValueError('Soglia valida: 1-180.')
-                data['threshold']=int(text);step='change';prompt='Variazione minima per un nuovo avviso? Da 1 a 60 minuti (consigliato 5).'
-            elif step=='change':
-                if not text.isdigit() or not 1<=int(text)<=60:raise ValueError('Valore valido: 1-60.')
-                data['change']=int(text);step='confirm'
+                if keep:data['threshold']=cur['threshold']
+                elif not text.isdigit() or not 1<=int(text)<=180:raise ValueError('Soglia valida: 1-180.')
+                else:data['threshold']=int(text)
+                step='confirm'
                 prompt=(f"Treno {data['number']} da {html.escape(data['station'])}\nGiorni: {','.join(['lun','mar','mer','gio','ven','sab','dom'][d] for d in data['days'])}\n"
-                        f"Fascia {data['start']}-{data['end']} ({self.tz})\nSoglia {data['threshold']} min, variazione {data['change']} min.\n"
+                        f"Fascia {data['start']}-{data['end']} ({self.tz})\nSoglia {data['threshold']} min.\n"
                         'Verifica della corsa rinviata alla prima interrogazione: non validata online in questa procedura.\n/conferma o /annulla')
             elif step in ('confirm','delete','delete_account'):
                 if cmd!='/conferma':raise ValueError('Usa /conferma oppure /annulla.')
@@ -384,15 +407,15 @@ class App:
                     else:
                         duplicate=db.execute('SELECT id FROM subscriptions WHERE user_id=? AND number=? AND upper(station)=upper(?) AND id!=?',(user['id'],data['number'],data['station'],data.get('edit_id',-1))).fetchone()
                         if duplicate:raise ValueError('Hai gia questo treno e stazione. Modifica il preferito esistente.')
-                        args=(data['number'],data['number'],data['station'],json.dumps(data['days']),data['start'],data['end'],data['threshold'],data['change'])
+                        args=(data['number'],data['number'],data['station'],json.dumps(data['days']),data['start'],data['end'],data['threshold'])
                         if data.get('edit_id'):
-                            cur=db.execute('UPDATE subscriptions SET name=?,number=?,station=?,weekdays=?,start=?,end=?,threshold=?,change_min=? WHERE id=? AND user_id=?',args+(data['edit_id'],user['id']))
+                            cur=db.execute('UPDATE subscriptions SET name=?,number=?,station=?,weekdays=?,start=?,end=?,threshold=? WHERE id=? AND user_id=?',args+(data['edit_id'],user['id']))
                             if not cur.rowcount:raise ValueError('Preferito non piu disponibile.')
                             db.execute('DELETE FROM notification_state WHERE subscription_id=?',(data['edit_id'],))
                             db.execute("UPDATE outbox SET status='cancelled' WHERE subscription_id=? AND status='pending'",(data['edit_id'],))
                         else:
                             if db.execute('SELECT count(*) FROM subscriptions WHERE user_id=?',(user['id'],)).fetchone()[0]>=self.config.get('max_subscriptions_per_user',10):raise ValueError('Limite preferiti raggiunto.')
-                            db.execute('INSERT INTO subscriptions(name,number,station,weekdays,start,end,threshold,change_min,user_id) VALUES (?,?,?,?,?,?,?,?,?)',args+(user['id'],))
+                            db.execute('INSERT INTO subscriptions(name,number,station,weekdays,start,end,threshold,user_id) VALUES (?,?,?,?,?,?,?,?)',args+(user['id'],))
                     db.execute('DELETE FROM conversations WHERE user_id=?',(user['id'],))
                 if step=='delete_account':self.queue(user['chat_id'],'Account e preferenze eliminati.')
                 else:self.reply(user,'Operazione completata.')
@@ -452,7 +475,7 @@ class App:
                 state=db.execute('SELECT * FROM notification_state WHERE subscription_id=?',(sub['id'],)).fetchone()
             if state['done']:return
             last=state['last_delay'];reason=None
-            if delay>=sub['threshold'] and (last is None or abs(delay-last)>=sub['change_min']):reason='threshold_reached' if last is None else 'delay_changed'
+            if delay>=sub['threshold'] and (last is None or abs(delay-last)>=fresh['change_min']):reason='threshold_reached' if last is None else 'delay_changed'
             elif delay<sub['threshold'] and last is not None and last>=sub['threshold']:reason='below_threshold'
             if state['error_notified']:
                 self.queue(user['chat_id'],f"Treno {sub['number']}: fonte dati nuovamente disponibile.\n{self.train_link(sub['number'],data['_run_key'])}",user=user['id'],sub=sub['id'],conn=db)
@@ -606,6 +629,7 @@ class App:
             BotCommand('stato','Stato dei preferiti nella finestra attuale'),
             BotCommand('pausa','Sospendi gli avvisi'),
             BotCommand('riprendi','Riattiva gli avvisi'),
+            BotCommand('variazione','Variazione minima per un nuovo avviso'),
             BotCommand('annulla','Annulla l\'operazione in corso'),
             BotCommand('id','Mostra il tuo Telegram ID'),
             BotCommand('cancella_account','Elimina account e dati'),
