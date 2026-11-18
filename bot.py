@@ -254,7 +254,7 @@ class App:
             event(logging.INFO,'user.access_changed',user=target['id'],status=status)
             return
         if cmd in ('/start','/aiuto'):
-            self.reply(user,'Bot treni personale\n/preferiti\n/aggiungi\n/modifica NUMERO_TRENO\n/elimina NUMERO_TRENO\n/stato\n/pausa\n/riprendi\n/annulla\n/cancella_account\nI giorni e gli orari sono personali.\n'+('/utenti - /approva ID - /rifiuta ID' if admin else ''))
+            self.reply(user,'Bot treni personale\n/preferiti\n/aggiungi\n/modifica [NUMERO_TRENO]\n/elimina [NUMERO_TRENO]\n/stato\n/pausa\n/riprendi\n/annulla\n/cancella_account\nI giorni e gli orari sono personali.\n'+('\nComandi amministratore: /utenti - /approva ID - /rifiuta ID' if admin else ''))
         elif cmd=='/annulla':
             with self.db() as db: db.execute('DELETE FROM conversations WHERE user_id=?',(user['id'],))
             self.reply(user,'Operazione annullata.')
@@ -267,20 +267,22 @@ class App:
             self.reply(user,'Avvisi sospesi.' if cmd=='/pausa' else 'Avvisi riattivati nelle finestre configurate.')
             event(logging.INFO,'user.pause_changed',user=user['id'],paused=cmd=='/pausa')
         elif cmd in ('/aggiungi','/modifica'):
-            data={}
             if cmd=='/modifica':
+                if len(parts)<2:
+                    self.pick(user,'modifica');return
                 sub=self.owned_sub(user,parts)
                 if not sub:return
-                data['edit_id']=sub['id']
-            elif len(self.subscriptions(user['id']))>=self.config.get('max_subscriptions_per_user',10):
+                self.proceed(user,'modifica',sub);return
+            if len(self.subscriptions(user['id']))>=self.config.get('max_subscriptions_per_user',10):
                 self.reply(user,'Limite preferiti raggiunto.');return
-            self.conversation(user,'number',data)
+            self.conversation(user,'number',{})
             self.reply(user,'Numero del treno? (/annulla per uscire)')
         elif cmd=='/elimina':
+            if len(parts)<2:
+                self.pick(user,'elimina');return
             sub=self.owned_sub(user,parts)
             if not sub:return
-            self.conversation(user,'delete',{'id':sub['id']})
-            self.reply(user,f"Eliminare il treno {sub['number']} da {html.escape(sub['station'])}? /conferma o /annulla")
+            self.proceed(user,'elimina',sub)
         elif cmd=='/cancella_account':
             if admin:
                 self.reply(user,'Account amministratore non eliminabile da questo comando.');return
@@ -307,6 +309,26 @@ class App:
             self.reply(user,'Piu preferiti con questo numero. Specifica la stazione:\n'+'\n'.join(f"{cmd} {s['number']} {html.escape(s['station'])}" for s in subs));return None
         return subs[0]
 
+    def pick(self,user,action):
+        # comando senza argomento (es. dal menu): chiedi quale preferito
+        subs=self.subscriptions(user['id'])
+        if not subs:
+            self.reply(user,'Nessun preferito: /aggiungi');return
+        if len(subs)==1:
+            self.proceed(user,action,subs[0]);return
+        self.conversation(user,'pick',{'action':action})
+        verb='modificare' if action=='modifica' else 'eliminare'
+        self.reply(user,f"Quale treno vuoi {verb}? Rispondi con il numero, aggiungendo la stazione se hai lo stesso numero da piu stazioni. (/annulla per uscire)\n"+'\n'.join(f"• {s['number']} da {html.escape(s['station'])}" for s in subs))
+
+    def proceed(self,user,action,sub):
+        if action=='modifica':
+            # il numero identifica il treno e non e modificabile: si parte dalla stazione
+            self.conversation(user,'station',{'edit_id':sub['id'],'number':sub['number']})
+            self.reply(user,f"Modifica del treno {sub['number']}.\nStazione di salita? Scrivi il nome completo, ad esempio Ottavia. (/annulla per uscire)")
+        else:
+            self.conversation(user,'delete',{'id':sub['id']})
+            self.reply(user,f"Eliminare il treno {sub['number']} da {html.escape(sub['station'])}? /conferma o /annulla")
+
     def wizard(self,user,text,cmd):
         row=self.db().execute('SELECT * FROM conversations WHERE user_id=?',(user['id'],)).fetchone()
         if not row:
@@ -316,6 +338,12 @@ class App:
             self.reply(user,'Procedura scaduta. Riparti con /aggiungi o /modifica NUMERO_TRENO.');return
         data=json.loads(row['data']);step=row['step']
         try:
+            if step=='pick':
+                tokens=text.split()
+                if cmd or not tokens or not tokens[0].isdigit():raise ValueError('Rispondi con il numero del treno, ad esempio 2345.')
+                sub=self.owned_sub(user,['/'+data['action']]+tokens)
+                if sub:self.proceed(user,data['action'],sub)
+                return
             if step=='number':
                 if not re.fullmatch(r'\d{1,7}',text):raise ValueError('Inserisci un numero treno valido.')
                 data['number']=text;step='station';prompt='Stazione di salita? Scrivi il nome completo, ad esempio Ottavia.'
@@ -573,8 +601,8 @@ class App:
             BotCommand('aiuto','Guida ai comandi'),
             BotCommand('preferiti','Elenca i treni preferiti'),
             BotCommand('aggiungi','Aggiungi un treno preferito'),
-            BotCommand('modifica','Modifica un preferito: /modifica NUMERO_TRENO'),
-            BotCommand('elimina','Elimina un preferito: /elimina NUMERO_TRENO'),
+            BotCommand('modifica','Modifica un treno preferito'),
+            BotCommand('elimina','Elimina un treno preferito'),
             BotCommand('stato','Stato dei preferiti nella finestra attuale'),
             BotCommand('pausa','Sospendi gli avvisi'),
             BotCommand('riprendi','Riattiva gli avvisi'),
