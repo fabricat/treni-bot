@@ -273,8 +273,8 @@ class App:
                 self.reply(user,'Comando riservato all amministratore.')
                 return
             if cmd=='/utenti':
-                rows=self.db().execute('SELECT id,status,paused FROM users ORDER BY id').fetchall()
-                self.reply(user,'\n'.join(f"#{r['id']} {r['status']} pausa={r['paused']}" for r in rows))
+                rows=self.db().execute('SELECT u.id,u.telegram_id,u.status,u.paused,u.created,(SELECT count(*) FROM subscriptions s WHERE s.user_id=u.id) AS subs FROM users u ORDER BY u.id').fetchall()
+                self.reply(user,'\n'.join(f"#{r['id']} {r['telegram_id']} {r['status']} pausa={r['paused']} da={datetime.fromtimestamp(r['created'],self.tz):%Y-%m-%d} preferiti={r['subs']}" for r in rows))
                 return
             if len(parts)!=2 or not parts[1].isdigit():
                 self.reply(user,f"Uso: {cmd} ID_INTERNO")
@@ -293,9 +293,8 @@ class App:
             event(logging.INFO,'user.access_changed',user=target['id'],status=status)
             return
         if cmd in ('/start','/aiuto'):
-            lines=['Bot treni personale']+[f"{usage(n,a)} - {d}" for n,a,d in COMMANDS if n!='aiuto']
-            lines.append('I giorni e gli orari sono personali.')
-            if admin:lines.append('Comandi amministratore: '+' - '.join(usage(n,a) for n,a,_ in ADMIN_COMMANDS))
+            lines=['Bot treni personale\n']+[f"{usage(n,a)} - {d}" for n,a,d in COMMANDS if n!='aiuto']
+            if admin:lines.append('\nComandi amministratore: '+' - '.join(usage(n,a) for n,a,_ in ADMIN_COMMANDS))
             self.reply(user,'\n'.join(lines))
         elif cmd=='/annulla':
             with self.db() as db: db.execute('DELETE FROM conversations WHERE user_id=?',(user['id'],))
