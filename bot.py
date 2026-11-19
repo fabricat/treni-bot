@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.error import URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -28,6 +28,43 @@ class ApiError(Exception):
 
 class SourceError(Exception):
     pass
+
+
+# unica definizione dei comandi: (nome, argomenti, descrizione)
+COMMANDS = [
+    ('preferiti', '', 'Elenca i treni preferiti'),
+    ('stato', '', 'Richiedi situazione dei treni preferiti attualmente sotto monitoraggio'),
+    ('start', '', 'Registrati o riattiva il bot'),
+    ('aggiungi', '', 'Aggiungi un treno preferito'),
+    ('modifica', '[NUMERO_TRENO]', 'Modifica un treno preferito'),
+    ('elimina', '[NUMERO_TRENO]', 'Elimina un treno preferito'),
+    ('pausa', '', 'Sospendi gli avvisi'),
+    ('riprendi', '', 'Riattiva gli avvisi'),
+    ('variazione', 'MINUTI', 'Variazione minima per un nuovo avviso'),
+    ('annulla', '', "Annulla l'operazione in corso"),
+    ('cancella_account', '', 'Elimina il tuo account'),
+    ('aiuto', '', 'Guida ai comandi'),
+]
+ADMIN_COMMANDS = [
+    ('utenti', '', 'Elenca gli utenti'),
+    ('approva', 'ID', 'Approva un utente'),
+    ('rifiuta', 'ID', 'Rifiuta un utente'),
+]
+KNOWN_COMMANDS = {f'/{name}' for name, _, _ in COMMANDS + ADMIN_COMMANDS} | {'/conferma'}
+
+
+def usage(name, args):
+    return f'/{name} {args}'.rstrip()
+
+
+DAYS_NAMES = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom']
+
+
+def days_text(wd):
+    # wd: lista di giorni-settimana oppure data ISO (monitoraggio per un solo giorno)
+    if isinstance(wd, str):
+        return wd
+    return 'tutti' if len(wd) == 7 else ','.join(DAYS_NAMES[d] for d in wd)
 
 
 class App:
@@ -176,17 +213,15 @@ class App:
         return ''
 
     def list_preferences(self,user):
-        days=['lun','mar','mer','gio','ven','sab','dom']
         subs=self.subscriptions(user['id'])
         head=f"Pausa: {'si' if user['paused'] else 'no'} | Variazione nuovo avviso: {user['change_min']} min"
         if not subs:
             return head+'\nNessun preferito: /aggiungi'
         lines=[head]
         for s in subs:
-            wd=json.loads(s['weekdays'])
             link=self.known_link(s,label=s['number'])
             number=link[1:] if link else s['number']
-            lines.append(f"• Treno {number} da {html.escape(s['station'])} | {'tutti' if len(wd)==7 else ','.join(days[d] for d in wd)} | {s['start']}-{s['end']} | soglia {s['threshold']} min")
+            lines.append(f"• Treno {number} da {html.escape(s['station'])} | {days_text(json.loads(s['weekdays']))} | {s['start']}-{s['end']} | soglia {s['threshold']} min")
         return '\n'.join(lines)
 
     def handle(self, update):
@@ -201,11 +236,8 @@ class App:
             return
         cmd=parts[0].split('@')[0].lower() if text.startswith('/') else ''
         user=self.user(sender)
-        known={'/start','/id','/aiuto','/preferiti','/aggiungi','/modifica','/elimina','/stato','/pausa','/riprendi','/variazione','/annulla','/conferma','/approva','/rifiuta','/utenti','/cancella_account'}
+        known=KNOWN_COMMANDS
         event(logging.INFO if user and user['status']=='active' else logging.DEBUG,'command.received',user=user['id'] if user else None,command=cmd if cmd in known else 'input')
-        if cmd=='/id':
-            self.queue(chat['id'],f"Il tuo Telegram user ID: {sender}"+(f"\nID interno: {user['id']}" if user else ''))
-            return
         if cmd=='/start' and user and user['status']=='unreachable':
             with self.db() as db:db.execute("UPDATE users SET status='active' WHERE id=?",(user['id'],))
             user=self.user(sender)
@@ -213,7 +245,7 @@ class App:
             mode=os.environ.get('REGISTRATION_MODE','approval')
             allowed={int(v) for v in os.environ.get('ALLOWED_TELEGRAM_IDS','').split(',') if v.strip().isdigit()}
             if mode=='allowlist' and sender not in allowed:
-                self.queue(chat['id'],'Accesso non autorizzato.')
+                self.queue(chat['id'],f"Accesso non autorizzato. Il tuo ID Telegram e {sender}: comunicalo all'amministratore per essere abilitato.")
                 return
             if self.db().execute("SELECT count(*) FROM users").fetchone()[0]>=self.config.get('max_users',50):
                 self.queue(chat['id'],'Registrazioni temporaneamente chiuse.')
@@ -261,7 +293,10 @@ class App:
             event(logging.INFO,'user.access_changed',user=target['id'],status=status)
             return
         if cmd in ('/start','/aiuto'):
-            self.reply(user,'Bot treni personale\n/preferiti\n/aggiungi\n/modifica [NUMERO_TRENO]\n/elimina [NUMERO_TRENO]\n/stato\n/pausa\n/riprendi\n/variazione MINUTI\n/annulla\n/cancella_account\nI giorni e gli orari sono personali.\n'+('\nComandi amministratore: /utenti - /approva ID - /rifiuta ID' if admin else ''))
+            lines=['Bot treni personale']+[f"{usage(n,a)} - {d}" for n,a,d in COMMANDS if n!='aiuto']
+            lines.append('I giorni e gli orari sono personali.')
+            if admin:lines.append('Comandi amministratore: '+' - '.join(usage(n,a) for n,a,_ in ADMIN_COMMANDS))
+            self.reply(user,'\n'.join(lines))
         elif cmd=='/annulla':
             with self.db() as db: db.execute('DELETE FROM conversations WHERE user_id=?',(user['id'],))
             self.reply(user,'Operazione annullata.')
@@ -351,7 +386,6 @@ class App:
             with self.db() as db:db.execute('DELETE FROM conversations WHERE user_id=?',(user['id'],))
             self.reply(user,'Procedura scaduta. Riparti con /aggiungi o /modifica NUMERO_TRENO.');return
         data=json.loads(row['data']);step=row['step']
-        days_names=['lun','mar','mer','gio','ven','sab','dom']
         cur=data.get('cur')
         keep=cur is not None and text.strip()=='='
         attuale=lambda value:f" Attuale: {value}" if cur else ''
@@ -369,14 +403,17 @@ class App:
                 if keep:data['station']=cur['station']
                 elif cmd or not 2<=len(text)<=100:raise ValueError('Nome stazione non valido.')
                 else:data['station']=text
-                step='days';prompt='Giorni? Scrivi lun,mar,mer,gio,ven oppure tutti.'+attuale(cur and ('tutti' if len(cur['days'])==7 else ','.join(days_names[d] for d in cur['days'])))
+                step='days';prompt='Giorni? Scrivi lun,mar,mer,gio,ven, tutti, oppure oggi/domani per un solo giorno.'+attuale(cur and days_text(cur['days']))
             elif step=='days':
                 names={'lun':0,'mar':1,'mer':2,'gio':3,'ven':4,'sab':5,'dom':6}
-                values=re.split(r'[,\s]+',text.lower())
+                low=text.lower()
                 if keep:data['days']=cur['days']
-                elif text.lower()=='tutti':data['days']=list(range(7))
+                elif low in ('oggi','domani'):
+                    data['days']=(datetime.now(self.tz)+timedelta(days=low=='domani')).date().isoformat()
+                elif low=='tutti':data['days']=list(range(7))
                 else:
-                    if not values or any(v not in names for v in values):raise ValueError('Usa lun,mar,mer,gio,ven,sab,dom.')
+                    values=re.split(r'[,\s]+',low)
+                    if not values or any(v not in names for v in values):raise ValueError('Usa lun,mar,mer,gio,ven,sab,dom, tutti oppure oggi/domani.')
                     data['days']=sorted({names[v] for v in values})
                 step='window';prompt='Finestra locale? (es. 06:50-09:00) Non puo attraversare mezzanotte.'+attuale(cur and f"{cur['start']}-{cur['end']}")
             elif step=='window':
@@ -393,7 +430,7 @@ class App:
                 elif not text.isdigit() or not 1<=int(text)<=180:raise ValueError('Soglia valida: 1-180.')
                 else:data['threshold']=int(text)
                 step='confirm'
-                prompt=(f"Treno {data['number']} da {html.escape(data['station'])}\nGiorni: {','.join(['lun','mar','mer','gio','ven','sab','dom'][d] for d in data['days'])}\n"
+                prompt=(f"Treno {data['number']} da {html.escape(data['station'])}\n{'Giorno' if isinstance(data['days'],str) else 'Giorni'}: {days_text(data['days'])}\n"
                         f"Fascia {data['start']}-{data['end']} ({self.tz})\nSoglia {data['threshold']} min.\n"
                         'Verifica della corsa rinviata alla prima interrogazione: non validata online in questa procedura.\n/conferma o /annulla')
             elif step in ('confirm','delete','delete_account'):
@@ -514,8 +551,10 @@ class App:
             subs=self.subscriptions(user['id'])
             scheduled_count=0
             for sub in subs:
-                # finestra personale: giorno configurato e orario start<=ora<end
-                scheduled=local.weekday() in json.loads(sub['weekdays']) and sub['start']<=local.strftime('%H:%M')<sub['end']
+                # finestra personale: giorno configurato (lista settimanale o data singola) e orario start<=ora<end
+                wd=json.loads(sub['weekdays'])
+                day_ok=local.date().isoformat()==wd if isinstance(wd,str) else local.weekday() in wd
+                scheduled=day_ok and sub['start']<=local.strftime('%H:%M')<sub['end']
                 scheduled_count+=scheduled
                 active=not user['paused'] and sub['enabled'] and scheduled
                 if active or (is_manual and scheduled):groups.setdefault(sub['number'],[]).append((user,sub,active,is_manual and scheduled))
@@ -549,6 +588,9 @@ class App:
             for uid,value in manual.items():db.execute('DELETE FROM meta WHERE key=? AND value=?',(f'manual:{uid}',value))
             db.execute("DELETE FROM outbox WHERE status!='pending' AND created<?",(time.time()-86400,))
             db.execute('DELETE FROM conversations WHERE updated<?',(time.time()-1800,))
+            # i preferiti per un solo giorno scadono quando la data e passata (JSON stringa: "YYYY-MM-DD")
+            expired=db.execute("DELETE FROM subscriptions WHERE weekdays LIKE '\"%' AND substr(weekdays,2,10)<?",(datetime.now(self.tz).date().isoformat(),)).rowcount
+            if expired:event(logging.INFO,'subscriptions.expired',count=expired)
 
     async def on_update(self,update,context):
         await asyncio.to_thread(self.handle,update.to_dict())
@@ -619,26 +661,8 @@ class App:
             self.stop.wait(1.1 if busy else 0.5)
 
     async def setup_commands(self,bot):
-        commands=[
-            BotCommand('start','Registrati o riattiva il bot'),
-            BotCommand('aiuto','Guida ai comandi'),
-            BotCommand('preferiti','Elenca i treni preferiti'),
-            BotCommand('aggiungi','Aggiungi un treno preferito'),
-            BotCommand('modifica','Modifica un treno preferito'),
-            BotCommand('elimina','Elimina un treno preferito'),
-            BotCommand('stato','Stato dei preferiti nella finestra attuale'),
-            BotCommand('pausa','Sospendi gli avvisi'),
-            BotCommand('riprendi','Riattiva gli avvisi'),
-            BotCommand('variazione','Variazione minima per un nuovo avviso'),
-            BotCommand('annulla','Annulla l\'operazione in corso'),
-            BotCommand('id','Mostra il tuo Telegram ID'),
-            BotCommand('cancella_account','Elimina account e dati'),
-        ]
-        admin_commands=commands+[
-            BotCommand('utenti','Elenca gli utenti'),
-            BotCommand('approva','Approva un utente: /approva ID'),
-            BotCommand('rifiuta','Rifiuta un utente: /rifiuta ID'),
-        ]
+        commands=[BotCommand(n,d) for n,_,d in COMMANDS]
+        admin_commands=commands+[BotCommand(n,f"{d}: {usage(n,a)}" if a else d) for n,a,d in ADMIN_COMMANDS]
         await bot.set_my_commands(commands)
         await bot.set_my_commands(admin_commands,scope=BotCommandScopeChat(chat_id=self.admin))
 

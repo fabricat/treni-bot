@@ -3,9 +3,26 @@
 Prototipo autonomo. Nessuna porta in ingresso.
 
 ## Configurazione
-Obbligatorie in .env: TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID.
-Opzionali via ambiente (default): TIMEZONE (Europe/Rome), POLL_SECONDS (60), ERROR_ALERT_AFTER_MINUTES (10), CACHE_SECONDS (45), MAX_USERS (50), MAX_SUBSCRIPTIONS_PER_USER (10), NOTIFICATION_TTL_SECONDS (900), MAX_SEND_ATTEMPTS (12), ERROR_SUMMARY_SECONDS (300), VIAGGIATRENO_BASE, REGISTRATION_MODE (approval|allowlist|open), DB_PATH (/data/state.sqlite), LOG_LEVEL.
-I preferiti si gestiscono solo via bot (/aggiungi, /modifica, /elimina); weekdays: 0=lunedi, 6=domenica. Le finestre non possono attraversare mezzanotte.
+Obbligatorie in .env:
+* TELEGRAM_BOT_TOKEN
+* TELEGRAM_ADMIN_ID
+
+Opzionali via ambiente (default):
+* TIMEZONE (Europe/Rome)
+* POLL_SECONDS (60)
+* ERROR_ALERT_AFTER_MINUTES (10)
+* CACHE_SECONDS (45)
+* MAX_USERS (50)
+* MAX_SUBSCRIPTIONS_PER_USER (10)
+* NOTIFICATION_TTL_SECONDS (900)
+* MAX_SEND_ATTEMPTS (12)
+* ERROR_SUMMARY_SECONDS (300)
+* VIAGGIATRENO_BASE (https://www.viaggiatreno.it/infomobilita/resteasy/viaggiatreno)
+* REGISTRATION_MODE (**approval**|allowlist|open)
+* DB_PATH (/data/state.sqlite)
+* LOG_LEVEL (INFO)
+
+I preferiti si gestiscono solo via bot (/aggiungi, /modifica, /elimina); weekdays: 0=lunedi, 6=domenica. Nel wizard i giorni accettano anche "oggi" o "domani" per monitorare un treno per un solo giorno (il preferito scade automaticamente a data passata). Le finestre non possono attraversare mezzanotte.
 La stazione e risolta per nome esatto ignorando maiuscole e spazi ripetuti.
 Non sono previsti menu interattivi per modificare i preferiti in questa versione.
 
