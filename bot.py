@@ -495,7 +495,9 @@ class App:
         fmt=lambda ms:datetime.fromtimestamp(float(ms)/1000,self.tz).strftime('%H:%M') if ms else 'n/d'
         text=f"Treno {sub['number']} - {html.escape(sub['station'])}\nPartenza prevista: {fmt(stop.get('partenza_teorica'))}\nRitardo corrente del treno: {delay:+g} min"
         if stop.get('partenzaReale'):text+='\nPartito dalla fermata: '+fmt(stop['partenzaReale'])
-        if data.get('oraUltimoRilevamento'):text+='\nUltimo rilevamento: '+fmt(data['oraUltimoRilevamento'])
+        if data.get('oraUltimoRilevamento'):
+            last_station=data.get('stazioneUltimoRilevamento')
+            text+='\nUltimo rilevamento: '+fmt(data['oraUltimoRilevamento'])+(f' a {html.escape(last_station)}' if last_station and last_station!='--' else '')
         return delay,text+'\nIl ritardo corrente non e una previsione garantita alla tua fermata.\n'+self.train_link(sub['number'],data['_run_key'])
 
     def evaluate(self,sub,user,data,stop,now):
