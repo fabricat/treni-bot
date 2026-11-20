@@ -36,7 +36,7 @@ Se non risulta partito continua fino alla fine della finestra, anche se in forte
 Segnala dati indisponibili dopo 10 minuti; non interpreta l'assenza di dati come puntualita.
 Non implementa riconoscimento soppressioni o cambi binario: servono verifiche su risposte reali.
 /stato mostra solo i preferiti nella finestra attuale (giorni e fascia oraria configurati); non modifica la cronologia degli avvisi.
-/pausa sospende fino a /riprendi, anche dopo riavvio.
+/pausa mostra lo stato degli avvisi e li sospende o riattiva dopo /conferma (persistente anche dopo riavvio).
 La cronologia e persistente nel volume Docker. Conserva soltanto lo stato piu recente per treno.
 
 ## Limiti e verifica

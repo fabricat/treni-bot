@@ -38,8 +38,7 @@ COMMANDS = [
     ('aggiungi', '', 'Aggiungi un treno preferito'),
     ('modifica', '[NUMERO_TRENO]', 'Modifica un treno preferito'),
     ('elimina', '[NUMERO_TRENO]', 'Elimina un treno preferito'),
-    ('pausa', '', 'Sospendi gli avvisi'),
-    ('riprendi', '', 'Riattiva gli avvisi'),
+    ('pausa', '', 'Sospendi o riattiva gli avvisi'),
     ('variazione', 'MINUTI', 'Variazione minima per un nuovo avviso'),
     ('annulla', '', "Annulla l'operazione in corso"),
     ('cancella_account', '', 'Elimina il tuo account'),
@@ -55,6 +54,13 @@ KNOWN_COMMANDS = {f'/{name}' for name, _, _ in COMMANDS + ADMIN_COMMANDS} | {'/c
 
 def usage(name, args):
     return f'/{name} {args}'.rstrip()
+
+
+def menu(admin=False):
+    commands = [BotCommand(n, d) for n, _, d in COMMANDS if n != 'start']
+    if admin:
+        commands += [BotCommand(n, f"{d}: {usage(n, a)}" if a else d) for n, a, d in ADMIN_COMMANDS]
+    return commands
 
 
 DAYS_NAMES = ['lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom']
@@ -255,6 +261,8 @@ class App:
                 db.execute("INSERT INTO users(telegram_id,chat_id,status,timezone,created) VALUES (?,?,?,?,?)",(sender,chat['id'],status,str(self.tz),time.time()))
             user=self.user(sender)
             event(logging.INFO,'user.registered',user=user['id'],status=status)
+            if status=='active':
+                self.refresh_menu(chat['id'],True)
             if status=='pending':
                 admin=self.user(self.admin)
                 self.reply(admin,f"Richiesta accesso utente interno #{user['id']}.\n/approva {user['id']}\n/rifiuta {user['id']}",key=f"approval:{user['id']}")
@@ -267,6 +275,7 @@ class App:
         if cmd=='/start':
             with self.db() as db:
                 db.execute('UPDATE users SET chat_id=? WHERE id=?',(chat['id'],user['id']))
+            self.refresh_menu(chat['id'],True,admin=sender==self.admin)
         admin=sender==self.admin
         if cmd in ('/approva','/rifiuta','/utenti'):
             if not admin:
@@ -289,6 +298,7 @@ class App:
                 if status!='active':
                     db.execute("UPDATE outbox SET status='cancelled' WHERE user_id=? AND status='pending'",(target['id'],))
             self.reply(target,'Accesso approvato. Usa /aggiungi.' if status=='active' else 'Accesso non autorizzato.')
+            self.refresh_menu(target['chat_id'],status=='active')
             self.reply(user,f"Utente #{target['id']}: {status}")
             event(logging.INFO,'user.access_changed',user=target['id'],status=status)
             return
@@ -300,13 +310,9 @@ class App:
             with self.db() as db: db.execute('DELETE FROM conversations WHERE user_id=?',(user['id'],))
             self.reply(user,'Operazione annullata.')
         elif cmd=='/preferiti': self.reply(user,self.list_preferences(user))
-        elif cmd in ('/pausa','/riprendi'):
-            with self.db() as db:
-                db.execute('UPDATE users SET paused=? WHERE id=?',(int(cmd=='/pausa'),user['id']))
-                if cmd=='/pausa':
-                    db.execute("UPDATE outbox SET status='cancelled' WHERE user_id=? AND subscription_id IS NOT NULL AND status='pending'",(user['id'],))
-            self.reply(user,'Avvisi sospesi.' if cmd=='/pausa' else 'Avvisi riattivati nelle finestre configurate.')
-            event(logging.INFO,'user.pause_changed',user=user['id'],paused=cmd=='/pausa')
+        elif cmd=='/pausa':
+            self.conversation(user,'pause',{})
+            self.reply(user,f"Avvisi attualmente {'sospesi' if user['paused'] else 'attivi'}. {'Riattivarli' if user['paused'] else 'Sospenderli'}? /conferma o /annulla")
         elif cmd=='/variazione':
             if len(parts)!=2 or not parts[1].isdigit() or not 1<=int(parts[1])<=60:
                 self.reply(user,f"Variazione minima perche un nuovo avviso venga inviato.\nAttuale: {user['change_min']} min. Uso: /variazione MINUTI (1-60)")
@@ -432,12 +438,17 @@ class App:
                 prompt=(f"Treno {data['number']} da {html.escape(data['station'])}\n{'Giorno' if isinstance(data['days'],str) else 'Giorni'}: {days_text(data['days'])}\n"
                         f"Fascia {data['start']}-{data['end']} ({self.tz})\nSoglia {data['threshold']} min.\n"
                         'Verifica della corsa rinviata alla prima interrogazione: non validata online in questa procedura.\n/conferma o /annulla')
-            elif step in ('confirm','delete','delete_account'):
+            elif step in ('confirm','delete','delete_account','pause'):
                 if cmd!='/conferma':raise ValueError('Usa /conferma oppure /annulla.')
+                paused=0 if user['paused'] else 1
                 with self.db() as db:
                     if step=='delete_account':
                         db.execute('DELETE FROM users WHERE id=?',(user['id'],))
                         db.execute('DELETE FROM meta WHERE key=?',(f"manual:{user['id']}",))
+                    elif step=='pause':
+                        db.execute('UPDATE users SET paused=? WHERE id=?',(paused,user['id']))
+                        if paused:
+                            db.execute("UPDATE outbox SET status='cancelled' WHERE user_id=? AND subscription_id IS NOT NULL AND status='pending'",(user['id'],))
                     elif step=='delete':
                         db.execute('DELETE FROM subscriptions WHERE id=? AND user_id=?',(data['id'],user['id']))
                     else:
@@ -453,7 +464,13 @@ class App:
                             if db.execute('SELECT count(*) FROM subscriptions WHERE user_id=?',(user['id'],)).fetchone()[0]>=self.config.get('max_subscriptions_per_user',10):raise ValueError('Limite preferiti raggiunto.')
                             db.execute('INSERT INTO subscriptions(name,number,station,weekdays,start,end,threshold,user_id) VALUES (?,?,?,?,?,?,?,?)',args+(user['id'],))
                     db.execute('DELETE FROM conversations WHERE user_id=?',(user['id'],))
-                if step=='delete_account':self.queue(user['chat_id'],'Account e preferenze eliminati.')
+                if step=='delete_account':
+                    self.refresh_menu(user['chat_id'],False)
+                    self.queue(user['chat_id'],'Account e preferenze eliminati.')
+                elif step=='pause':
+                    self.reply(user,'Avvisi sospesi.' if paused else 'Avvisi riattivati nelle finestre configurate.')
+                    event(logging.INFO,'user.pause_changed',user=user['id'],paused=bool(paused))
+                    return
                 else:self.reply(user,'Operazione completata.')
                 event(logging.INFO,'preferences.changed',user=user['id'],action=step)
                 return
@@ -518,8 +535,15 @@ class App:
             if state['error_notified']:
                 self.queue(user['chat_id'],f"Treno {sub['number']}: fonte dati nuovamente disponibile.\n{self.train_link(sub['number'],data['_run_key'])}",user=user['id'],sub=sub['id'],conn=db)
             db.execute('UPDATE notification_state SET error_since=NULL,error_notified=0 WHERE subscription_id=?',(sub['id'],))
-            if reason:
-                self.queue(user['chat_id'],f"Avviso: {reason}\n{text}",user=user['id'],sub=sub['id'],conn=db)
+            if reason and reason != 'below_threshold':
+                avviso=f"Avviso: {reason}\n{text}"
+                if reason == 'threshold_reached':
+                    avviso=f"""{avviso}
+                    
+                    Riceverai ulteriori notifiche solo se il ritardo cambia di {fresh['change_min']} minuti (puoi modificare questa soglia con il comando /variazione).
+                    
+                    Puoi vedere lo stato aggiornato con il comando /stato."""
+                self.queue(user['chat_id'],avviso,user=user['id'],sub=sub['id'],conn=db)
                 db.execute('UPDATE notification_state SET last_delay=? WHERE subscription_id=?',(delay,sub['id']))
                 event(logging.INFO,'notification.queued',user=user['id'],subscription=sub['id'],train=sub['number'],delay_min=delay,reason=reason)
             if stop.get('partenzaReale'):db.execute('UPDATE notification_state SET done=1 WHERE subscription_id=?',(sub['id'],))
@@ -662,10 +686,19 @@ class App:
             self.stop.wait(1.1 if busy else 0.5)
 
     async def setup_commands(self,bot):
-        commands=[BotCommand(n,d) for n,_,d in COMMANDS]
-        admin_commands=commands+[BotCommand(n,f"{d}: {usage(n,a)}" if a else d) for n,a,d in ADMIN_COMMANDS]
-        await bot.set_my_commands(commands)
-        await bot.set_my_commands(admin_commands,scope=BotCommandScopeChat(chat_id=self.admin))
+        await bot.set_my_commands([BotCommand(n,d) for n,_,d in COMMANDS if n=='start'])
+        for row in self.db().execute("SELECT chat_id,telegram_id FROM users WHERE status='active'").fetchall():
+            try:await bot.set_my_commands(menu(row['telegram_id']==self.admin),scope=BotCommandScopeChat(chat_id=row['chat_id']))
+            except TelegramError as exc:event(logging.WARNING,'commands.menu_failed',chat=row['chat_id'],error=str(exc))
+
+    def refresh_menu(self,chat_id,registered,admin=False):
+        async def apply():
+            try:
+                scope=BotCommandScopeChat(chat_id=chat_id)
+                if registered:await self.application.bot.set_my_commands(menu(admin),scope=scope)
+                else:await self.application.bot.delete_my_commands(scope=scope)
+            except TelegramError as exc:event(logging.WARNING,'commands.menu_failed',chat=chat_id,error=str(exc))
+        if self.loop:asyncio.run_coroutine_threadsafe(apply(),self.loop)
 
     async def watch(self,application):
         while not self.stop.is_set():
